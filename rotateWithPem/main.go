@@ -3,190 +3,213 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
+	"encoding/json"
 	"fmt"
-	"io"
+	"log"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 )
 
 var (
-	privateKeyFile = "private_key.pem"
-	privateKey     *rsa.PrivateKey
-	publicKeys     []*rsa.PublicKey
-	index          int // Index to keep track of the current public key
-	mu             sync.Mutex
+	publicKeys  jwk.Set
+	privateKeys map[string]*rsa.PrivateKey
+	mutex       sync.Mutex
 )
 
-const maxKeys = 3 // Maximum number of public keys to maintain
-
-func main() {
-	// Load private key from PEM file or generate a new one if the file doesn't exist
-	if _, err := os.Stat(privateKeyFile); os.IsNotExist(err) {
-		privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			panic(err)
-		}
-		savePrivateKey(privateKey)
-	} else {
-		privateKey, err = loadPrivateKey()
-		if err != nil {
-			panic(err)
-		}
-	}
-	publicKeys = []*rsa.PublicKey{&privateKey.PublicKey}
-
-	go rotatePublicKeys()
-
-	http.HandleFunc("/generate", generateToken)
-	http.HandleFunc("/verify", verifyToken)
-	http.HandleFunc("/public-keys", getPublicKeys)
-	fmt.Println("Server listening on port 8080")
-	http.ListenAndServe(":8080", nil)
-}
-
-func generateToken(w http.ResponseWriter, r *http.Request) {
-	token := jwt.New(jwt.SigningMethodRS256)
-	token.Claims = jwt.StandardClaims{
-		ExpiresAt: time.Now().Add(5 * time.Minute).Unix(),
-		Issuer:    "rotate-implementer",
-		Audience:  "test-development",
-		IssuedAt:  time.Now().Unix(),
-	}
-	tokenString, err := token.SignedString(privateKey)
+func generateKeyPair() (*rsa.PrivateKey, jwk.Key, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, nil, err
 	}
-	w.Write([]byte(tokenString))
+
+	key, err := jwk.FromRaw(privateKey.PublicKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	kid := fmt.Sprintf("key-%d", time.Now().Unix())
+	key.Set(jwk.KeyIDKey, kid)
+	key.Set(jwk.AlgorithmKey, jwa.RS256)
+
+	return privateKey, key, nil
 }
 
-func verifyToken(w http.ResponseWriter, r *http.Request) {
-	tokenString := r.Header.Get("Authorization")
-	if tokenString == "" {
-		http.Error(w, "Authorization header missing", http.StatusBadRequest)
-		return
-	}
-
-	// Remove "Bearer " prefix from token string
-	tokenString = tokenString[len("Bearer "):]
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	for _, publicKey := range publicKeys {
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			return publicKey, nil
-		})
-		if err == nil && token.Valid {
-			fmt.Println("Token is valid")
-			w.Write([]byte("Token is valid"))
-			return
-		}
-	}
-
-	fmt.Println("Invalid token")
-	http.Error(w, "Invalid token", http.StatusUnauthorized)
-}
-
-func getPublicKeys(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	for _, publicKey := range publicKeys {
-		pemBytes := pem.EncodeToMemory(&pem.Block{
-			Type:  "RSA PUBLIC KEY",
-			Bytes: x509.MarshalPKCS1PublicKey(publicKey),
-		})
-		w.Write(pemBytes)
-		w.Write([]byte("\n"))
-	}
-}
-
-func rotatePublicKeys() {
-	ticker := time.NewTicker(15 * time.Second)
+func rotateKeys() {
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		newPrivateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	for {
+		<-ticker.C
+
+		privateKey1, publicKey1, err := generateKeyPair()
 		if err != nil {
-			fmt.Println("Error generating new private key:", err)
-			continue
-		}
-		// TODO: put .temp the previous pem file
-		err = savePrivateKey(newPrivateKey) // Save the new private key to the PEM file
-		if err != nil {
-			fmt.Println("Error saving new private key:", err)
+			log.Printf("Error generating key pair: %v", err)
 			continue
 		}
 
-		newPublicKey := &newPrivateKey.PublicKey
-
-		mu.Lock()
-		if len(publicKeys) < maxKeys {
-			publicKeys = append(publicKeys, newPublicKey)
-		} else {
-			// Replace the oldest public key with the new one
-			publicKeys[index] = newPublicKey
-			index = (index + 1) % maxKeys // Move index circularly
+		privateKey2, publicKey2, err := generateKeyPair()
+		if err != nil {
+			log.Printf("Error generating key pair: %v", err)
+			continue
 		}
-		// Update the privateKey variable with the new private key
-		privateKey = newPrivateKey
-		mu.Unlock()
 
-		fmt.Println("Rotated public keys")
+		mutex.Lock()
+		privateKeys = map[string]*rsa.PrivateKey{
+			publicKey1.KeyID(): privateKey1,
+			publicKey2.KeyID(): privateKey2,
+		}
+		publicKeys = jwk.NewSet()
+		publicKeys.AddKey(publicKey1)
+		publicKeys.AddKey(publicKey2)
+		mutex.Unlock()
+
+		savePrivateKeysToFile()
 	}
 }
 
-func savePrivateKey(key *rsa.PrivateKey) error {
-	// Encode private key to PEM format
-	pemKey := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}
+func savePrivateKeysToFile() {
+	for kid, privateKey := range privateKeys {
+		fileName := fmt.Sprintf("private_key_%s.pem", kid)
+		file, err := os.Create(fileName)
+		if err != nil {
+			log.Printf("Error creating PEM file: %v", err)
+			continue
+		}
+		defer file.Close()
 
-	// Open file for writing
-	file, err := os.Create(privateKeyFile)
-	if err != nil {
-		return err
+		pemKey, err := jwk.FromRaw(privateKey)
+		if err != nil {
+			log.Printf("Error creating JWK from private key: %v", err)
+			continue
+		}
+
+		pemKey.Set(jwk.AlgorithmKey, jwa.RS256)
+		pemKey.Set(jwk.KeyUsageKey, "sig")
+
+		json.NewEncoder(file).Encode(pemKey)
 	}
-	defer file.Close()
-
-	// Write PEM data to file
-	err = pem.Encode(file, pemKey)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
-func loadPrivateKey() (*rsa.PrivateKey, error) {
-	file, err := os.Open(privateKeyFile)
-	if err != nil {
-		fmt.Println(err)
-		return nil, err
+func generateTokenHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	var privateKey *rsa.PrivateKey
+	var kid string
+	for k, v := range privateKeys {
+		privateKey = v
+		kid = k
+		break
 	}
-	defer file.Close()
+	mutex.Unlock()
 
-	// Read PEM data from file
-	pemData, err := io.ReadAll(file)
+	token := jwt.New()
+	token.Set(jwt.SubjectKey, "user123")
+	token.Set(jwt.IssuedAtKey, time.Now())
+	token.Set(jwt.ExpirationKey, time.Now().Add(5*time.Minute))
+	token.Set(jwt.JwtIDKey, kid)
+
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, privateKey))
 	if err != nil {
-		fmt.Println(err)
-		return nil, err
+		http.Error(w, fmt.Sprintf("Error signing token: %v", err), http.StatusInternalServerError)
+		return
 	}
 
-	// Decode PEM data
-	block, _ := pem.Decode(pemData)
-	if block == nil || block.Type != "RSA PRIVATE KEY" {
-		return nil, fmt.Errorf("failed to decode PEM block containing private key")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(signed)
+}
+
+func verifyTokenHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header is required", http.StatusBadRequest)
+		return
 	}
-	// Parse the RSA private key
-	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+
+	var tokenString string
+	fmt.Sscanf(authHeader, "Bearer %s", &tokenString)
+	if tokenString == "" {
+		http.Error(w, "Invalid token", http.StatusBadRequest)
+		return
+	}
+
+	mutex.Lock()
+	keys := publicKeys
+	mutex.Unlock()
+
+	var verified bool
+
+	ctx := r.Context()
+	it := keys.Keys(ctx)
+
+	for {
+		ok := it.Next(ctx)
+		if !ok {
+			break // Exit loop when there are no more keys
+		}
+
+		key := it.Pair().Value
+
+		token, err := jwt.Parse([]byte(tokenString), jwt.WithKey(jwa.RS256, key))
+		if err == nil {
+			verified = true
+			break // Exit loop if token is verified
+		}
+		fmt.Println("TOKEN", token)
+	}
+
+	if !verified {
+		http.Error(w, fmt.Sprintf("Error verifying token: %v", nil), http.StatusUnauthorized)
+		return
+	}
+
+	response := map[string]interface{}{
+		"verified": true,
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func publicKeysHandler(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	keys := publicKeys
+	mutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(keys)
+}
+
+func main() {
+	privateKey1, publicKey1, err := generateKeyPair()
 	if err != nil {
-		return nil, err
+		log.Fatalf("Error generating key pair: %v", err)
 	}
-	return key, nil
+
+	privateKey2, publicKey2, err := generateKeyPair()
+	if err != nil {
+		log.Fatalf("Error generating key pair: %v", err)
+	}
+
+	privateKeys = map[string]*rsa.PrivateKey{
+		publicKey1.KeyID(): privateKey1,
+		publicKey2.KeyID(): privateKey2,
+	}
+	publicKeys = jwk.NewSet()
+	publicKeys.AddKey(publicKey1)
+	publicKeys.AddKey(publicKey2)
+
+	go rotateKeys()
+
+	r := mux.NewRouter()
+	r.HandleFunc("/generate", generateTokenHandler).Methods("GET")
+	r.HandleFunc("/verify", verifyTokenHandler).Methods("GET")
+	r.HandleFunc("/public-keys", publicKeysHandler).Methods("GET")
+
+	http.Handle("/", r)
+	log.Println("Server started on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
